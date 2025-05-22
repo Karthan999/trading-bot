@@ -15,20 +15,25 @@ def get_db_connection():
     return conn
 
 def init_db():
-    with get_db_connection() as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS orders (
-            order_id TEXT PRIMARY KEY,
-            symbol TEXT,
-            quantity REAL,
-            price REAL,
-            tp_price REAL,
-            status TEXT
-        )''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            value REAL
-        )''')
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY,
+                symbol TEXT,
+                quantity REAL,
+                price REAL,
+                tp_price REAL,
+                status TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value REAL
+            )''')
+            conn.commit()
+            logging.info("Baza danych zainicjalizowana pomyślnie")
+    except Exception as e:
+        logging.error(f"Błąd inicjalizacji bazy danych: {str(e)}")
+        raise
 
 @app.route('/')
 def home():
@@ -115,6 +120,12 @@ def webhook():
         logging.error(f"Błąd w webhooku: {str(e)}")
         return f"Błąd: {str(e)}", 500
 
-if __name__ == '__main__':
+# Inicjalizacja bazy danych przy starcie
+try:
     init_db()
+except Exception as e:
+    logging.error(f"Błąd przy starcie aplikacji: {str(e)}")
+    raise
+
+if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
