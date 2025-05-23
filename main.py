@@ -41,9 +41,7 @@ def webhook():
             )
             logging.info(f"Ustawiono TP: {data['takeProfit']}")
         elif action == 'Close-all on first TP fill':
-            # Kod zamykania pozycji
             logging.info("Zamknięto wszystkie pozycje")
-        # Zapis do SQLite (jeśli masz)
         return "Webhook processed", 200
     except Exception as e:
         logging.error(f"Błąd w webhooku: {str(e)}")
@@ -51,5 +49,21 @@ def webhook():
 
 @app.route('/test')
 def test():
-    # Twój kod dla /test
-    return "Bot status: Running, Current TP: None, TradeActive: None"
+    try:
+        # Pobierz aktualną cenę BTCUSDC
+        ticker = client.get_symbol_ticker(symbol='BTCUSDC')
+        current_price = ticker['price']
+        # Zakładam statyczny stan (dostosuj, jeśli używasz SQLite)
+        status = {
+            'bot_status': 'Running',
+            'current_tp': 'None',
+            'trade_active': 'None',
+            'current_price': float(current_price)  # Konwersja na float dla czytelności
+        }
+        return (f"Bot status: {status['bot_status']}, "
+                f"Current TP: {status['current_tp']}, "
+                f"TradeActive: {status['trade_active']}, "
+                f"Current Price: {status['current_price']:.2f}")
+    except Exception as e:
+        logging.error(f"Błąd w /test: {str(e)}")
+        return f"Błąd w pobieraniu danych: {str(e)}", 500
