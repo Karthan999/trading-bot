@@ -5,5 +5,3 @@ ccxt==4.2.24
 aiohttp==3.9.5
 cryptography==42.0.5
 gunicorn==23.0.0
-asgiref==3.8.1  # Wymagane dla flask[async]
-gevent==24.2.1  # Worker asynchroniczny dla Gunicorn
