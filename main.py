@@ -166,8 +166,8 @@ def webhook():
         take_profit = float(data.get('take_profit'))
 
         # Dane konfiguracyjne z ENV
-        encrypted_api_key = os.getenv('ENCRYPTED_API_KEY')
-        encrypted_api_secret = os.getenv('ENCRYPTED_API_SECRET')
+        encrypted_api_key = os.getenv('BINANCE_API_KEY')
+        encrypted_api_secret = os.getenv('BINANCE_API_SECRET')
         api_key = decrypt_key(encrypted_api_key)
         api_secret = decrypt_key(encrypted_api_secret)
 
