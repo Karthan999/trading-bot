@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from binance.client import Client
 from binance.enums import *
+from celery import Celery
 from dotenv import load_dotenv
 
 # Configure logging
@@ -21,9 +22,30 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
+REDIS_URL = os.getenv("REDIS_URL")
 
 # Initialize FastAPI
 app = FastAPI()
+
+# Initialize Celery
+celery = Celery(
+    'main',
+    broker=REDIS_URL,
+    backend=REDIS_URL,
+    broker_connection_retry_on_startup=True
+)
+celery.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+    task_default_queue='default',
+    task_queues={
+        'default': {'exchange': 'default', 'routing_key': 'default'},
+        'take_profit': {'exchange': 'take_profit', 'routing_key': 'take_profit'}
+    }
+)
 
 # Initialize Binance client
 try:
@@ -41,6 +63,7 @@ class WebhookData(BaseModel):
     quantity: str
     takeProfit: str
 
+@celery.task(queue='default')
 def place_buy_order(symbol: str, quantity: float, price: float, take_profit: float):
     """Place a buy limit order with a take-profit limit order."""
     try:
@@ -65,11 +88,12 @@ def place_buy_order(symbol: str, quantity: float, price: float, take_profit: flo
             price=take_profit
         )
         logger.info(f"Take-profit order placed: {tp_order}")
-        return order, tp_order
+        return {"status": "success", "order": order, "tp_order": tp_order}
     except Exception as e:
         logger.error(f"Error placing order for {symbol}: {str(e)}")
         raise
 
+@celery.task(queue='take_profit')
 def update_take_profit(symbol: str, take_profit: float):
     """Update take-profit for all open positions."""
     try:
@@ -92,10 +116,12 @@ def update_take_profit(symbol: str, take_profit: float):
                         price=take_profit
                     )
                     logger.info(f"Updated TP for {symbol} to {take_profit}: {tp_order}")
+        return {"status": "success", "message": f"Updated TP to {take_profit} for {symbol}"}
     except Exception as e:
         logger.error(f"Error updating TP for {symbol}: {str(e)}")
         raise
 
+@celery.task(queue='default')
 def close_all_positions(symbol: str):
     """Close all open positions and cancel orders."""
     try:
@@ -113,6 +139,7 @@ def close_all_positions(symbol: str):
                         quantity=quantity
                     )
                     logger.info(f"Closed position for {symbol}: {order}")
+        return {"status": "success", "message": f"Closed all positions for {symbol}"}
     except Exception as e:
         logger.error(f"Error closing positions for {symbol}: {str(e)}")
         raise
@@ -128,16 +155,16 @@ async def webhook(data: WebhookData):
         symbol = data.symbol.upper()
 
         if "Buy Fib" in data.action:
-            order, tp_order = place_buy_order(symbol, quantity, price, take_profit)
-            return {"status": "success", "order": order, "tp_order": tp_order}
+            task = place_buy_order.apply_async(args=[symbol, quantity, price, take_profit], queue='default')
+            return {"status": "queued", "task_id": task.id}
 
         elif "TP Fib" in data.action:
-            update_take_profit(symbol, take_profit)
-            return {"status": "success", "message": f"Updated TP to {take_profit} for {symbol}"}
+            task = update_take_profit.apply_async(args=[symbol, take_profit], queue='take_profit')
+            return {"status": "queued", "task_id": task.id}
 
         elif "Close-all" in data.action:
-            close_all_positions(symbol)
-            return {"status": "success", "message": f"Closed all positions for {symbol}"}
+            task = close_all_positions.apply_async(args=[symbol], queue='default')
+            return {"status": "queued", "task_id": task.id}
 
         else:
             logger.error(f"Unknown action: {data.action}")
