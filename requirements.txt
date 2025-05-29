@@ -1,7 +1,5 @@
-Flask==3.0.3
-celery==5.4.0
-redis==5.0.8
-ccxt==4.2.24
-aiohttp==3.9.5
-cryptography==42.0.5
-gunicorn==23.0.0
+fastapi==0.115.0
+uvicorn==0.30.6
+python-binance==1.0.19
+python-dotenv==1.0.1
+pydantic==2.9.2
