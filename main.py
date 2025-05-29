@@ -1,208 +1,172 @@
-import logging
 import os
-import sqlite3
+import logging
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from binance.client import Client
+from binance.enums import *
 import json
-import asyncio
-import ccxt.async_support as ccxt
-from flask import Flask, request
-from celery import Celery
-from redis import Redis
-from cryptography.fernet import Fernet
-from datetime import datetime
+from typing import Optional
+from dotenv import load_dotenv
 
-# Logowanie na stdout (żeby było widoczne w Koyeb)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-app = Flask(__name__)
-
-# Konfiguracja Celery
-redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-celery = Celery('main', broker=redis_url, backend=redis_url)
-celery.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    timezone='UTC',
-    enable_utc=True,
-    task_queues={
-        'default': {'exchange': 'default'},
-        'take_profit': {'exchange': 'take_profit'}
-    }
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('trading_bot.log')
+    ]
 )
+logger = logging.getLogger(__name__)
 
-# Redis do cache'owania cen
-redis_client = Redis.from_url(redis_url, decode_responses=True)
+# Load environment variables
+load_dotenv()
 
-# Klucz do szyfrowania kluczy API
-encryption_key = os.getenv('ENCRYPTION_KEY', Fernet.generate_key())
-fernet = Fernet(encryption_key)
+# Binance API credentials (stored in Koyeb environment variables)
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-def encrypt_key(key):
-    return fernet.encrypt(key.encode()).decode()
+# Initialize FastAPI app
+app = FastAPI()
 
-def decrypt_key(encrypted_key):
+# Initialize Binance client
+try:
+    binance_client = Client(API_KEY, API_SECRET)
+    logger.info("Connected to Binance API successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Binance client: {str(e)}")
+    raise Exception("Binance client initialization failed")
+
+# Pydantic model for webhook payload
+class WebhookData(BaseModel):
+    action: str
+    symbol: str
+    price: str
+    quantity: str
+    takeProfit: Optional[str] = None
+
+# Fibonacci take-profit levels (example mapping, adjust based on your strategy)
+FIB_LEVELS = {
+    "200": 2.0,  # 200% Fibonacci extension
+    "300": 3.0,
+    "400": 4.0,
+    "500": 5.0,
+    "600": 6.0,
+    "700": 7.0
+}
+
+def calculate_take_profit(action: str, price: float) -> float:
+    """Calculate take-profit price based on action and entry price."""
     try:
-        return fernet.decrypt(encrypted_key.encode()).decode()
+        if "TP Fib" in action:
+            fib_level = action.split("TP Fib ")[1]
+            multiplier = FIB_LEVELS.get(fib_level, 1.0)
+            return price * (1 + multiplier / 100)  # Example: Increase price by fib level percentage
+        return price  # Default to entry price if no valid fib level
     except Exception as e:
-        logging.error(f"Błąd deszyfrowania klucza: {str(e)}")
-        return None
+        logger.error(f"Error calculating take-profit for action {action}: {str(e)}")
+        raise
 
-def init_db():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id TEXT PRIMARY KEY, api_key TEXT, api_secret TEXT, exchange TEXT,
-                  initial_capital REAL, preferred_pair TEXT, subscribed INTEGER DEFAULT 1)''')
-    conn.commit()
-    conn.close()
+def place_buy_order(symbol: str, quantity: float, price: float, take_profit: float):
+    """Place a buy order with a take-profit limit order."""
+    try:
+        # Place market buy order
+        order = binance_client.create_order(
+            symbol=symbol,
+            side=SIDE_BUY,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        logger.info(f"Buy order placed: {order}")
 
-    conn = sqlite3.connect('trading_data.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, exchange TEXT, symbol TEXT,
-                  action TEXT, price REAL, take_profit REAL, quantity REAL, status TEXT, timestamp TEXT)''')
-    conn.commit()
-    conn.close()
+        # Place take-profit limit order
+        tp_order = binance_client.create_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            type=ORDER_TYPE_LIMIT,
+            timeInForce=TIME_IN_FORCE_GTC,
+            quantity=quantity,
+            price=take_profit
+        )
+        logger.info(f"Take-profit order placed: {tp_order}")
+        return order, tp_order
+    except Exception as e:
+        logger.error(f"Error placing order for {symbol}: {str(e)}")
+        raise
 
-init_db()
+def close_all_positions(symbol: str):
+    """Close all open positions for a symbol."""
+    try:
+        # Cancel all open orders
+        binance_client.cancel_open_orders(symbol=symbol)
+        logger.info(f"All open orders canceled for {symbol}")
 
-def get_subscribed_users():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute("SELECT user_id, api_key, api_secret, exchange, initial_capital, preferred_pair FROM users WHERE subscribed = 1")
-    users = c.fetchall()
-    conn.close()
-    return users
+        # Get current position
+        account = binance_client.get_account()
+        for asset in account['balances']:
+            if asset['asset'] == symbol.split("USDC")[0]:  # e.g., BTC from BTCUSDC
+                quantity = float(asset['free'])
+                if quantity > 0:
+                    order = binance_client.create_order(
+                        symbol=symbol,
+                        side=SIDE_SELL,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=quantity
+                    )
+                    logger.info(f"Closed position for {symbol}: {order}")
+    except Exception as e:
+        logger.error(f"Error closing positions for {symbol}: {str(e)}")
+        raise
 
-def log_trade(user_id, exchange, symbol, action, price, take_profit, quantity, status):
-    conn = sqlite3.connect('trading_data.db')
-    c = conn.cursor()
-    timestamp = datetime.utcnow().isoformat()
-    c.execute("INSERT INTO trades (user_id, exchange, symbol, action, price, take_profit, quantity, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-              (user_id, exchange, symbol, action, price, take_profit, quantity, status, timestamp))
-    conn.commit()
-    conn.close()
-
-def map_symbol(exchange, preferred_pair, base_symbol):
-    return preferred_pair if preferred_pair else base_symbol
-
-async def get_current_price(exchange_name, symbol, api_key, api_secret, cache_ttl):
-    cache_key = f"price:{exchange_name}:{symbol}"
-    cached_price = redis_client.get(cache_key)
-    if cached_price:
-        return float(cached_price)
-
-    exchange_class = getattr(ccxt, exchange_name)
-    exchange = exchange_class({
-        'apiKey': api_key,
-        'secret': api_secret,
-        'enableRateLimit': True,
-    })
+@app.post("/webhook")
+async def webhook(data: WebhookData):
+    """Handle incoming webhook from TradingView."""
+    logger.info(f"Otrzymano dane webhooka: {data.dict()}")
 
     try:
-        ticker = await exchange.fetch_ticker(symbol)
-        price = ticker['last']
-        redis_client.setex(cache_key, cache_ttl, price)
-        return price
+        # Validate and parse data
+        price = float(data.price)
+        quantity = float(data.quantity)
+        symbol = data.symbol.upper()
+
+        # Handle take-profit
+        take_profit = data.takeProfit
+        if take_profit == "{{strategy.order.exit}}":
+            # Calculate take-profit based on action
+            take_profit = calculate_take_profit(data.action, price)
+        else:
+            take_profit = float(take_profit) if take_profit else price
+
+        # Process actions
+        if "Buy Fib" in data.action:
+            order, tp_order = place_buy_order(symbol, quantity, price, take_profit)
+            return {"status": "success", "order": order, "tp_order": tp_order}
+
+        elif "TP Fib" in data.action:
+            # Take-profit order already set in buy action; log for reference
+            logger.info(f"Take-profit signal received for {symbol} at {take_profit}")
+            return {"status": "success", "message": "Take-profit noted"}
+
+        elif "Close-all" in data.action:
+            close_all_positions(symbol)
+            return {"status": "success", "message": f"All positions closed for {symbol}"}
+
+        else:
+            logger.error(f"Unknown action: {data.action}")
+            raise HTTPException(status_code=400, detail=f"Unknown action: {data.action}")
+
+    except ValueError as ve:
+        logger.error(f"Błąd w webhooku: {str(ve)}")
+        raise HTTPException(status_code=500, detail=str(ve))
     except Exception as e:
-        logging.error(f"Błąd pobierania ceny z {exchange_name}: {str(e)}")
-        return None
-    finally:
-        await exchange.close()
+        logger.error(f"Błąd w webhooku: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-def calculate_quantity(capital, price, risk_percentage=0.01):
-    try:
-        risk_amount = capital * risk_percentage
-        quantity = risk_amount / price
-        return round(quantity, 8)
-    except Exception as e:
-        logging.error(f"Błąd obliczania ilości: {str(e)}")
-        return 0
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Koyeb."""
+    return {"status": "healthy"}
 
-@celery.task
-def process_order(user_id, exchange_name, api_key, api_secret, symbol, action, price, take_profit, quantity):
-    exchange_class = getattr(ccxt, exchange_name)
-    exchange = exchange_class({
-        'apiKey': api_key,
-        'secret': api_secret,
-        'enableRateLimit': True,
-    })
-
-    try:
-        if 'Buy Fib' in action:
-            order = exchange.create_limit_buy_order(symbol, quantity, price)
-            logging.info(f"Ustawiono zlecenie BUY LIMIT: {order} dla {user_id} na {exchange_name}")
-            log_trade(user_id, exchange_name, symbol, action, price, take_profit, quantity, 'open')
-            order = exchange.create_limit_sell_order(symbol, quantity, take_profit)
-            logging.info(f"Ustawiono zlecenie SELL LIMIT (TP): {order} dla {user_id} na {exchange_name}")
-            log_trade(user_id, exchange_name, symbol, f"TP for {action}", take_profit, take_profit, quantity, 'open')
-        elif 'TP Fib' in action:
-            open_trades = exchange.fetch_open_orders(symbol)
-            for trade in open_trades:
-                if trade['side'] == 'buy' and trade['price'] <= price:
-                    exchange.cancel_order(trade['id'], symbol)
-                    logging.info(f"Anulowano zlecenie BUY: {trade['id']} dla {user_id} na {exchange_name}")
-                    log_trade(user_id, exchange_name, symbol, f"Cancelled {action}", price, take_profit, quantity, 'cancelled')
-        elif action == 'Close-all on first TP fill':
-            open_trades = exchange.fetch_open_orders(symbol)
-            for trade in open_trades:
-                exchange.cancel_order(trade['id'], symbol)
-                logging.info(f"Anulowano zlecenie: {trade['id']} dla {user_id} na {exchange_name}")
-                log_trade(user_id, exchange_name, symbol, action, price, take_profit, trade['amount'], 'cancelled')
-    except Exception as e:
-        logging.error(f"Błąd zlecenia dla {user_id} na {exchange_name}: {str(e)}")
-        log_trade(user_id, exchange_name, symbol, action, price, take_profit, quantity, f'error: {str(e)}')
-    finally:
-        exchange.close()
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        data = request.get_json()
-        logging.info(f"Otrzymano dane webhooka: {data}")
-
-        action = data.get('action')
-        price = float(data.get('price'))
-        take_profit = float(data.get('take_profit'))
-
-        # Dane konfiguracyjne z ENV
-        encrypted_api_key = os.getenv('BINANCE_API_KEY')
-        encrypted_api_secret = os.getenv('BINANCE_API_SECRET')
-        api_key = decrypt_key(encrypted_api_key)
-        api_secret = decrypt_key(encrypted_api_secret)
-
-        exchange = os.getenv('EXCHANGE', 'binance')
-        capital = float(os.getenv('CAPITAL', 1000))  # możesz też na sztywno ustawić
-        symbol = os.getenv('SYMBOL', 'BTC/USDC')     # lub wpisz np. 'BTC/USDC'
-
-        quantity = calculate_quantity(capital, price)
-
-        # Uruchom Celery zlecenie
-        process_order.delay("single_user", exchange, api_key, api_secret, symbol, action, price, take_profit, quantity)
-
-        return f"[{action}] na {symbol} wysłane do giełdy", 200
-    except Exception as e:
-        logging.error(f"Błąd w webhooku: {str(e)}")
-        return f"Błąd: {str(e)}", 500
-
-
-@app.route('/test')
-async def test():
-    try:
-        users = get_subscribed_users()
-        if not users:
-            return "Brak użytkowników", 400
-
-        user = users[0]
-        user_id, encrypted_api_key, encrypted_api_secret, exchange, _, preferred_pair = user
-        api_key = decrypt_key(encrypted_api_key)
-        api_secret = decrypt_key(encrypted_api_secret)
-        symbol = map_symbol(exchange, preferred_pair, 'BTCUSDT')
-        price = await get_current_price(exchange, symbol, api_key, api_secret, cache_ttl=30)
-        return f"Bot status: Running, Active users: {len(users)}, {exchange} {symbol} Price: {price}", 200
-    except Exception as e:
-        logging.error(f"Błąd testu: {str(e)}")
-        return f"Błąd: {str(e)}", 500
-        
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
