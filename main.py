@@ -6,6 +6,7 @@ from binance.client import Client
 from binance.enums import *
 from celery import Celery
 from dotenv import load_dotenv
+import redis
 
 # Configure logging
 logging.basicConfig(
@@ -23,6 +24,15 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 REDIS_URL = os.getenv("REDIS_URL")
+
+# Test Redis connection
+try:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    logger.info("Connected to Redis successfully")
+except Exception as e:
+    logger.error(f"Failed to connect to Redis: {str(e)}")
+    raise Exception("Redis connection failed")
 
 # Initialize FastAPI
 app = FastAPI()
@@ -44,7 +54,9 @@ celery.conf.update(
     task_queues={
         'default': {'exchange': 'default', 'routing_key': 'default'},
         'take_profit': {'exchange': 'take_profit', 'routing_key': 'take_profit'}
-    }
+    },
+    broker_connection_max_retries=5,
+    broker_pool_limit=10
 )
 
 # Initialize Binance client
