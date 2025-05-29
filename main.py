@@ -155,28 +155,41 @@ def process_order(user_id, exchange_name, api_key, api_secret, symbol, action, p
     finally:
         exchange.close()
 
-@app.route('/register_user', methods=['POST'])
-def register_user():
+@app.route('/webhook', methods=['POST'])
+def webhook():
     try:
         data = request.get_json()
-        user_id = data['user_id']
-        api_key = encrypt_key(data['api_key'])
-        api_secret = encrypt_key(data['api_secret'])
-        exchange = data['exchange']
-        initial_capital = float(data['initial_capital'])
-        preferred_pair = data['preferred_pair']
+        logging.info(f"Otrzymano dane webhooka: {data}")
 
+        user_id = data.get('user_id')
+        action = data.get('action')
+        price = float(data.get('price'))
+        take_profit = float(data.get('take_profit'))
+
+        # Pobierz użytkownika
         conn = sqlite3.connect('users.db')
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (user_id, api_key, api_secret, exchange, initial_capital, preferred_pair, subscribed) VALUES (?, ?, ?, ?, ?, ?, 1)",
-                  (user_id, api_key, api_secret, exchange, initial_capital, preferred_pair))
-        conn.commit()
+        c.execute("SELECT api_key, api_secret, exchange, initial_capital, preferred_pair FROM users WHERE user_id = ?", (user_id,))
+        result = c.fetchone()
         conn.close()
 
-        logging.info(f"Zarejestrowano użytkownika: {user_id} dla {exchange}, para: {preferred_pair}")
-        return "User registered", 200
+        if not result:
+            logging.warning(f"Nie znaleziono użytkownika {user_id}")
+            return "User not found", 404
+
+        encrypted_api_key, encrypted_api_secret, exchange, capital, preferred_pair = result
+        api_key = decrypt_key(encrypted_api_key)
+        api_secret = decrypt_key(encrypted_api_secret)
+
+        symbol = map_symbol(exchange, preferred_pair, 'BTC/USDC')
+        quantity = calculate_quantity(capital, price)
+
+        # Uruchom Celery task
+        process_order.delay(user_id, exchange, api_key, api_secret, symbol, action, price, take_profit, quantity)
+
+        return f"Zlecenie '{action}' dla {symbol} zostało wysłane", 200
     except Exception as e:
-        logging.error(f"Błąd rejestracji użytkownika: {str(e)}")
+        logging.error(f"Błąd w webhooku: {str(e)}")
         return f"Błąd: {str(e)}", 500
 
 @app.route('/test')
