@@ -161,36 +161,30 @@ def webhook():
         data = request.get_json()
         logging.info(f"Otrzymano dane webhooka: {data}")
 
-        user_id = data.get('user_id')
         action = data.get('action')
         price = float(data.get('price'))
         take_profit = float(data.get('take_profit'))
 
-        # Pobierz użytkownika
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        c.execute("SELECT api_key, api_secret, exchange, initial_capital, preferred_pair FROM users WHERE user_id = ?", (user_id,))
-        result = c.fetchone()
-        conn.close()
-
-        if not result:
-            logging.warning(f"Nie znaleziono użytkownika {user_id}")
-            return "User not found", 404
-
-        encrypted_api_key, encrypted_api_secret, exchange, capital, preferred_pair = result
+        # Dane konfiguracyjne z ENV
+        encrypted_api_key = os.getenv('ENCRYPTED_API_KEY')
+        encrypted_api_secret = os.getenv('ENCRYPTED_API_SECRET')
         api_key = decrypt_key(encrypted_api_key)
         api_secret = decrypt_key(encrypted_api_secret)
 
-        symbol = map_symbol(exchange, preferred_pair, 'BTC/USDC')
+        exchange = os.getenv('EXCHANGE', 'binance')
+        capital = float(os.getenv('CAPITAL', 1000))  # możesz też na sztywno ustawić
+        symbol = os.getenv('SYMBOL', 'BTC/USDC')     # lub wpisz np. 'BTC/USDC'
+
         quantity = calculate_quantity(capital, price)
 
-        # Uruchom Celery task
-        process_order.delay(user_id, exchange, api_key, api_secret, symbol, action, price, take_profit, quantity)
+        # Uruchom Celery zlecenie
+        process_order.delay("single_user", exchange, api_key, api_secret, symbol, action, price, take_profit, quantity)
 
-        return f"Zlecenie '{action}' dla {symbol} zostało wysłane", 200
+        return f"[{action}] na {symbol} wysłane do giełdy", 200
     except Exception as e:
         logging.error(f"Błąd w webhooku: {str(e)}")
         return f"Błąd: {str(e)}", 500
+
 
 @app.route('/test')
 async def test():
